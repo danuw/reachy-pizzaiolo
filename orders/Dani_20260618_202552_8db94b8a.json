@@ -1,0 +1,33 @@
+{
+  "order_id": "8db94b8a",
+  "created_at_utc": "2026-06-18T20:25:52.755333+00:00",
+  "customer_name": "Dani",
+  "items": [
+    {
+      "category": "Pizza",
+      "name": "The Zekey",
+      "quantity": 1,
+      "notes": ""
+    },
+    {
+      "category": "Pizza",
+      "name": "The Neroli",
+      "quantity": 2,
+      "notes": ""
+    },
+    {
+      "category": "Pizza",
+      "name": "The Dan",
+      "quantity": 1,
+      "notes": ""
+    },
+    {
+      "category": "Drink",
+      "name": "Pimm's",
+      "quantity": 1,
+      "notes": ""
+    }
+  ],
+  "order_summary": "one Zekey, two Neroli, one Dan, and one Pimm’s",
+  "age_verified_for_alcohol": true
+}
