@@ -17,8 +17,32 @@ MENU_ITEMS = {
     "The Dan": "Pizza",
     "Coca Cola": "Drink",
     "Diet Coke": "Drink",
+    "Apple juice": "Drink",
+    "Sprite": "Drink",
+    "Cola Cao": "Drink",
     "Pimm's": "Drink",
     "Water": "Drink",
+}
+
+ITEM_ALIASES = {
+    "apple juice": "Apple juice",
+    "apple juce": "Apple juice",
+    "apple huice": "Apple juice",
+    "sprite": "Sprite",
+    "cola cao": "Cola Cao",
+    "colacao": "Cola Cao",
+    "coca cola": "Coca Cola",
+    "coke": "Coca Cola",
+    "diet coke": "Diet Coke",
+    "pimms": "Pimm's",
+    "pimm's": "Pimm's",
+    "water": "Water",
+    "zekey": "The Zekey",
+    "the zekey": "The Zekey",
+    "neroli": "The Neroli",
+    "the neroli": "The Neroli",
+    "dan": "The Dan",
+    "the dan": "The Dan",
 }
 
 OUT_OF_STOCK = {"The Allegra"}
@@ -38,7 +62,9 @@ def _safe_name(value: str) -> str:
 
 def _normalise_item(raw: Dict[str, Any]) -> Dict[str, Any]:
     """Validate and normalise one order item."""
-    name = str(raw.get("name", "")).strip()
+    raw_name = str(raw.get("name", "")).strip()
+    name = ITEM_ALIASES.get(raw_name.lower(), raw_name)
+
     if not name:
         raise ValueError("Every item must include a name.")
 
