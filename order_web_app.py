@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sqlite3
 import threading
@@ -12,6 +13,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, urlparse
+
+
+COMPLETE_REMOVAL_DELAY_SECONDS = 5
 
 
 def _escape_html(value: str) -> str:
@@ -53,6 +57,10 @@ def _format_order_details(order: dict[str, Any]) -> str:
     if bool(order.get("age_verified_for_alcohol", False)):
         lines.extend(["", "Age verification: true"])
 
+    if bool(order.get("_is_completed", False)):
+        seconds_left = int(order.get("_seconds_until_removal", 0))
+        lines.extend(["", f"Status: Completed (removes in {seconds_left}s)"])
+
     return "\n".join(lines)
 
 
@@ -75,13 +83,38 @@ def render_page(orders: list[dict[str, Any]], selected_id: str | None) -> str:
             active = " active" if selected and order_id == str(selected.get("order_id", "")) else ""
             href = "/?selected=" + quote(order_id)
             meta = _escape_html(f"{order_id} | {item_count} item(s)")
+            if bool(order.get("_is_completed", False)):
+                seconds_left = int(order.get("_seconds_until_removal", 0))
+                status = _escape_html(f"Completed - removing in {seconds_left}s")
+            else:
+                status = ""
+            action_html = ""
+            if not bool(order.get("_is_completed", False)):
+                action_html = (
+                    '<form method="post" action="/complete-order" class="quick-complete">'
+                    f'<input type="hidden" name="order_id" value="{_escape_html(order_id)}">'
+                    '<button type="submit">Complete</button>'
+                    "</form>"
+                )
             list_items.append(
-                f'<li class="order{active}"><a href="{href}"><div class="customer">{customer_name}</div><div class="meta">{meta}</div></a></li>'
+                f'<li class="order{active}"><div class="row"><a href="{href}"><div class="customer">{customer_name}</div><div class="meta">{meta}</div>'
+                + (f'<div class="status">{status}</div>' if status else "")
+                + f"</a>{action_html}</div></li>"
             )
 
     details_text = "Waiting for orders..."
     if selected:
         details_text = _escape_html(_format_order_details(selected))
+
+    details_action = ""
+    if selected and not bool(selected.get("_is_completed", False)):
+        selected_order_id = _escape_html(str(selected.get("order_id", "")))
+        details_action = (
+            '<form method="post" action="/complete-order" class="details-complete">'
+            f'<input type="hidden" name="order_id" value="{selected_order_id}">'
+            '<button type="submit">Mark Complete</button>'
+            "</form>"
+        )
 
     return f"""<!doctype html>
 <html lang="en">
@@ -135,8 +168,10 @@ def render_page(orders: list[dict[str, Any]], selected_id: str | None) -> str:
       overflow: auto;
     }}
     #order-list li {{ border-bottom: 1px solid var(--line); }}
+    #order-list .row {{ display: flex; align-items: center; gap: 8px; }}
     #order-list li a {{
       display: block;
+      flex: 1;
       padding: 10px 12px;
       color: inherit;
       text-decoration: none;
@@ -148,9 +183,24 @@ def render_page(orders: list[dict[str, Any]], selected_id: str | None) -> str:
       padding-left: 9px;
     }}
     #order-list li.empty {{ padding: 10px 12px; color: var(--muted); }}
+    #order-list .status {{ color: #2c6a37; font-size: 12px; margin-top: 4px; }}
     .customer {{ font-weight: 600; }}
     .meta {{ color: var(--muted); font-size: 12px; margin-top: 4px; }}
     #details {{ padding: 14px; white-space: pre-wrap; line-height: 1.45; }}
+    .quick-complete {{ padding-right: 10px; }}
+    .quick-complete button,
+    .details-complete button {{
+      background: #1a73e8;
+      color: #fff;
+      border: 0;
+      border-radius: 6px;
+      padding: 7px 10px;
+      cursor: pointer;
+      font-size: 12px;
+    }}
+    .quick-complete button:hover,
+    .details-complete button:hover {{ background: #1666cd; }}
+    .details-complete {{ padding: 0 14px 14px; }}
     @media (max-width: 860px) {{
       .layout {{ grid-template-columns: 1fr; }}
       #order-list {{ max-height: 260px; }}
@@ -166,6 +216,7 @@ def render_page(orders: list[dict[str, Any]], selected_id: str | None) -> str:
     <section class="panel">
       <h1>Order Details</h1>
       <div id="details">{details_text}</div>
+      {details_action}
     </section>
   </div>
 </body>
@@ -190,10 +241,21 @@ class OrderStore:
                 CREATE TABLE IF NOT EXISTS orders (
                     order_id TEXT PRIMARY KEY,
                     created_at_utc TEXT NOT NULL,
-                    payload_json TEXT NOT NULL
+                    payload_json TEXT NOT NULL,
+                    completed_at_epoch REAL,
+                    purge_after_epoch REAL
                 )
                 """
             )
+            existing_columns = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info(orders)").fetchall()
+                if len(row) > 1
+            }
+            if "completed_at_epoch" not in existing_columns:
+                conn.execute("ALTER TABLE orders ADD COLUMN completed_at_epoch REAL")
+            if "purge_after_epoch" not in existing_columns:
+                conn.execute("ALTER TABLE orders ADD COLUMN purge_after_epoch REAL")
             conn.commit()
 
     def add_order(self, order: dict[str, Any]) -> dict[str, Any]:
@@ -201,8 +263,14 @@ class OrderStore:
             with self._connection() as conn:
                 conn.execute(
                     """
-                    INSERT OR REPLACE INTO orders (order_id, created_at_utc, payload_json)
-                    VALUES (?, ?, ?)
+                    INSERT OR REPLACE INTO orders (
+                        order_id,
+                        created_at_utc,
+                        payload_json,
+                        completed_at_epoch,
+                        purge_after_epoch
+                    )
+                    VALUES (?, ?, ?, NULL, NULL)
                     """,
                     (
                         str(order.get("order_id", "")),
@@ -213,15 +281,47 @@ class OrderStore:
                 conn.commit()
         return order
 
-    def all_orders(self) -> list[dict[str, Any]]:
+    def mark_completed(self, order_id: str) -> bool:
+        if not order_id.strip():
+            return False
+
+        now_epoch = datetime.now(timezone.utc).timestamp()
+        purge_epoch = now_epoch + COMPLETE_REMOVAL_DELAY_SECONDS
+
         with self._lock:
             with self._connection() as conn:
+                result = conn.execute(
+                    """
+                    UPDATE orders
+                    SET completed_at_epoch = ?, purge_after_epoch = ?
+                    WHERE order_id = ?
+                      AND (completed_at_epoch IS NULL OR purge_after_epoch IS NULL)
+                    """,
+                    (now_epoch, purge_epoch, order_id),
+                )
+                conn.commit()
+                return result.rowcount > 0
+
+    def all_orders(self) -> list[dict[str, Any]]:
+        now_epoch = datetime.now(timezone.utc).timestamp()
+        with self._lock:
+            with self._connection() as conn:
+                conn.execute(
+                    """
+                    DELETE FROM orders
+                    WHERE purge_after_epoch IS NOT NULL
+                      AND purge_after_epoch <= ?
+                    """,
+                    (now_epoch,),
+                )
                 rows = conn.execute(
                     """
-                    SELECT payload_json FROM orders
+                    SELECT payload_json, completed_at_epoch, purge_after_epoch
+                    FROM orders
                     ORDER BY created_at_utc DESC, rowid DESC
                     """
                 ).fetchall()
+                conn.commit()
 
             result: list[dict[str, Any]] = []
             for row in rows:
@@ -230,6 +330,15 @@ class OrderStore:
                 except json.JSONDecodeError:
                     continue
                 if isinstance(payload, dict):
+                    completed_at_epoch = row[1]
+                    purge_after_epoch = row[2]
+                    if completed_at_epoch is not None and purge_after_epoch is not None:
+                        seconds_left = max(0, int(math.ceil(float(purge_after_epoch) - now_epoch)))
+                        payload["_is_completed"] = True
+                        payload["_seconds_until_removal"] = seconds_left
+                    else:
+                        payload["_is_completed"] = False
+                        payload["_seconds_until_removal"] = 0
                     result.append(payload)
             return result
 
@@ -268,6 +377,29 @@ class OrderDashboardHandler(BaseHTTPRequestHandler):
             return None
         return parsed if isinstance(parsed, dict) else None
 
+    def _read_form_body(self) -> dict[str, str] | None:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            return None
+        if length <= 0:
+            return None
+        raw = self.rfile.read(length)
+        data = parse_qs(raw.decode("utf-8"), keep_blank_values=True)
+        result: dict[str, str] = {}
+        for key, values in data.items():
+            if values:
+                result[key] = values[0]
+        return result
+
+    def _send_redirect(self, location: str) -> None:
+        self.send_response(HTTPStatus.SEE_OTHER)
+        self.send_header("Location", location)
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
+        self.end_headers()
+
     def do_GET(self) -> None:  # noqa: N802
         parsed_url = urlparse(self.path)
         path = parsed_url.path
@@ -293,7 +425,23 @@ class OrderDashboardHandler(BaseHTTPRequestHandler):
         self._send_json({"ok": False, "error": "Not found."}, status=HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:  # noqa: N802
-        if self.path != "/api/orders":
+        parsed_url = urlparse(self.path)
+        path = parsed_url.path
+
+        if path == "/complete-order":
+            form = self._read_form_body()
+            if form is None:
+                self._send_json({"ok": False, "error": "Invalid form body."}, status=HTTPStatus.BAD_REQUEST)
+                return
+            order_id = str(form.get("order_id", "")).strip()
+            if not order_id:
+                self._send_json({"ok": False, "error": "order_id is required."}, status=HTTPStatus.BAD_REQUEST)
+                return
+            STORE.mark_completed(order_id)
+            self._send_redirect("/?selected=" + quote(order_id))
+            return
+
+        if path != "/api/orders":
             self._send_json({"ok": False, "error": "Not found."}, status=HTTPStatus.NOT_FOUND)
             return
 
