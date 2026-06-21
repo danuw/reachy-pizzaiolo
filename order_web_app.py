@@ -33,22 +33,7 @@ def _format_order_details(order: dict[str, Any]) -> str:
         f"Order ID: {order.get('order_id', '')}",
         f"Created UTC: {order.get('created_at_utc', '')}",
         f"Customer: {order.get('customer_name', '')}",
-        "",
-        "Items:",
     ]
-
-    items = order.get("items")
-    if not isinstance(items, list) or not items:
-        lines.append("(no items)")
-    else:
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            line = f"- {item.get('quantity', '')} x {item.get('name', '')} ({item.get('category', '')})"
-            notes = str(item.get("notes", "")).strip()
-            if notes:
-                line += f" | notes: {notes}"
-            lines.append(line)
 
     summary = str(order.get("order_summary", "")).strip()
     if summary:
@@ -62,6 +47,18 @@ def _format_order_details(order: dict[str, Any]) -> str:
         lines.extend(["", f"Status: Completed (removes in {seconds_left}s)"])
 
     return "\n".join(lines)
+
+
+def _normalize_item_states(items: list[Any], raw_states: Any) -> list[bool]:
+    item_count = len(items)
+    if not isinstance(raw_states, list):
+        return [False] * item_count
+
+    normalized: list[bool] = []
+    for index in range(item_count):
+        value = raw_states[index] if index < len(raw_states) else False
+        normalized.append(bool(value))
+    return normalized
 
 
 def render_page(orders: list[dict[str, Any]], selected_id: str | None) -> str:
@@ -80,9 +77,10 @@ def render_page(orders: list[dict[str, Any]], selected_id: str | None) -> str:
             order_id = str(order.get("order_id", ""))
             customer_name = _escape_html(str(order.get("customer_name", "Unknown")))
             item_count = len(order.get("items", [])) if isinstance(order.get("items"), list) else 0
+            item_done_count = int(order.get("_item_done_count", 0))
             active = " active" if selected and order_id == str(selected.get("order_id", "")) else ""
             href = "/?selected=" + quote(order_id)
-            meta = _escape_html(f"{order_id} | {item_count} item(s)")
+            meta = _escape_html(f"{order_id} | {item_done_count}/{item_count} done")
             if bool(order.get("_is_completed", False)):
                 seconds_left = int(order.get("_seconds_until_removal", 0))
                 status = _escape_html(f"Completed - removing in {seconds_left}s")
@@ -103,8 +101,41 @@ def render_page(orders: list[dict[str, Any]], selected_id: str | None) -> str:
             )
 
     details_text = "Waiting for orders..."
+    details_items = ""
     if selected:
         details_text = _escape_html(_format_order_details(selected))
+        selected_order_id = _escape_html(str(selected.get("order_id", "")))
+        items = selected.get("items") if isinstance(selected.get("items"), list) else []
+        item_states = _normalize_item_states(items, selected.get("_item_states"))
+        rows: list[str] = []
+        if items:
+            for idx, item in enumerate(items):
+                if not isinstance(item, dict):
+                    continue
+                name = _escape_html(str(item.get("name", "")))
+                category = _escape_html(str(item.get("category", "")))
+                quantity = _escape_html(str(item.get("quantity", "")))
+                notes = _escape_html(str(item.get("notes", "")).strip())
+                is_done = bool(item_states[idx])
+                next_state = "false" if is_done else "true"
+                button_text = "Undo" if is_done else "Done"
+                notes_html = f'<div class="todo-notes">{notes}</div>' if notes else ""
+                done_class = " done" if is_done else ""
+                rows.append(
+                    f'<li class="todo{done_class}">'
+                    f'<div class="todo-main">{quantity} x {name} <span class="todo-cat">({category})</span></div>'
+                    f"{notes_html}"
+                    '<form method="post" action="/toggle-item" class="item-toggle">'
+                    f'<input type="hidden" name="order_id" value="{selected_order_id}">'
+                    f'<input type="hidden" name="item_index" value="{idx}">'
+                    f'<input type="hidden" name="next_state" value="{next_state}">'
+                    f'<button type="submit">{button_text}</button>'
+                    "</form>"
+                    "</li>"
+                )
+            details_items = '<ul class="item-todos">' + "".join(rows) + "</ul>"
+        else:
+            details_items = '<div class="todo-empty">No items on this order.</div>'
 
     details_action = ""
     if selected and not bool(selected.get("_is_completed", False)):
@@ -187,9 +218,36 @@ def render_page(orders: list[dict[str, Any]], selected_id: str | None) -> str:
     .customer {{ font-weight: 600; }}
     .meta {{ color: var(--muted); font-size: 12px; margin-top: 4px; }}
     #details {{ padding: 14px; white-space: pre-wrap; line-height: 1.45; }}
+    .item-todos {{
+      list-style: none;
+      margin: 0 14px 10px;
+      padding: 0;
+      border-top: 1px solid var(--line);
+    }}
+    .todo {{
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 8px;
+      align-items: center;
+      border-bottom: 1px solid var(--line);
+      padding: 10px 0;
+    }}
+    .todo.done .todo-main {{ text-decoration: line-through; color: #55606f; }}
+    .todo-main {{ font-weight: 600; white-space: normal; }}
+    .todo-cat {{ color: var(--muted); font-weight: 400; }}
+    .todo-notes {{
+      grid-column: 1 / 2;
+      color: var(--muted);
+      font-size: 12px;
+      white-space: normal;
+      margin-top: -2px;
+    }}
+    .item-toggle {{ grid-column: 2 / 3; grid-row: 1 / span 2; }}
+    .todo-empty {{ padding: 0 14px 10px; color: var(--muted); }}
     .quick-complete {{ padding-right: 10px; }}
     .quick-complete button,
-    .details-complete button {{
+    .details-complete button,
+    .item-toggle button {{
       background: #1a73e8;
       color: #fff;
       border: 0;
@@ -199,7 +257,8 @@ def render_page(orders: list[dict[str, Any]], selected_id: str | None) -> str:
       font-size: 12px;
     }}
     .quick-complete button:hover,
-    .details-complete button:hover {{ background: #1666cd; }}
+    .details-complete button:hover,
+    .item-toggle button:hover {{ background: #1666cd; }}
     .details-complete {{ padding: 0 14px 14px; }}
     @media (max-width: 860px) {{
       .layout {{ grid-template-columns: 1fr; }}
@@ -216,6 +275,7 @@ def render_page(orders: list[dict[str, Any]], selected_id: str | None) -> str:
     <section class="panel">
       <h1>Order Details</h1>
       <div id="details">{details_text}</div>
+      {details_items}
       {details_action}
     </section>
   </div>
@@ -242,6 +302,7 @@ class OrderStore:
                     order_id TEXT PRIMARY KEY,
                     created_at_utc TEXT NOT NULL,
                     payload_json TEXT NOT NULL,
+                    item_states_json TEXT,
                     completed_at_epoch REAL,
                     purge_after_epoch REAL
                 )
@@ -256,30 +317,85 @@ class OrderStore:
                 conn.execute("ALTER TABLE orders ADD COLUMN completed_at_epoch REAL")
             if "purge_after_epoch" not in existing_columns:
                 conn.execute("ALTER TABLE orders ADD COLUMN purge_after_epoch REAL")
+            if "item_states_json" not in existing_columns:
+                conn.execute("ALTER TABLE orders ADD COLUMN item_states_json TEXT")
             conn.commit()
 
     def add_order(self, order: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
             with self._connection() as conn:
+                items = order.get("items") if isinstance(order.get("items"), list) else []
+                item_states = [False] * len(items)
                 conn.execute(
                     """
                     INSERT OR REPLACE INTO orders (
                         order_id,
                         created_at_utc,
                         payload_json,
+                        item_states_json,
                         completed_at_epoch,
                         purge_after_epoch
                     )
-                    VALUES (?, ?, ?, NULL, NULL)
+                    VALUES (?, ?, ?, ?, NULL, NULL)
                     """,
                     (
                         str(order.get("order_id", "")),
                         str(order.get("created_at_utc", "")),
                         json.dumps(order, ensure_ascii=False),
+                        json.dumps(item_states),
                     ),
                 )
                 conn.commit()
         return order
+
+    def set_item_completed(self, order_id: str, item_index: int, completed: bool) -> bool:
+        if not order_id.strip() or item_index < 0:
+            return False
+
+        with self._lock:
+            with self._connection() as conn:
+                row = conn.execute(
+                    """
+                    SELECT payload_json, item_states_json
+                    FROM orders
+                    WHERE order_id = ?
+                    """,
+                    (order_id,),
+                ).fetchone()
+                if row is None:
+                    return False
+
+                try:
+                    payload = json.loads(row[0])
+                except json.JSONDecodeError:
+                    return False
+                if not isinstance(payload, dict):
+                    return False
+
+                items = payload.get("items") if isinstance(payload.get("items"), list) else []
+                if item_index >= len(items):
+                    return False
+
+                raw_states: Any = None
+                if row[1]:
+                    try:
+                        raw_states = json.loads(row[1])
+                    except json.JSONDecodeError:
+                        raw_states = None
+
+                states = _normalize_item_states(items, raw_states)
+                states[item_index] = completed
+
+                result = conn.execute(
+                    """
+                    UPDATE orders
+                    SET item_states_json = ?
+                    WHERE order_id = ?
+                    """,
+                    (json.dumps(states), order_id),
+                )
+                conn.commit()
+                return result.rowcount > 0
 
     def mark_completed(self, order_id: str) -> bool:
         if not order_id.strip():
@@ -316,7 +432,7 @@ class OrderStore:
                 )
                 rows = conn.execute(
                     """
-                    SELECT payload_json, completed_at_epoch, purge_after_epoch
+                    SELECT payload_json, completed_at_epoch, purge_after_epoch, item_states_json
                     FROM orders
                     ORDER BY created_at_utc DESC, rowid DESC
                     """
@@ -330,6 +446,17 @@ class OrderStore:
                 except json.JSONDecodeError:
                     continue
                 if isinstance(payload, dict):
+                    items = payload.get("items") if isinstance(payload.get("items"), list) else []
+                    raw_states: Any = None
+                    if row[3]:
+                        try:
+                            raw_states = json.loads(row[3])
+                        except json.JSONDecodeError:
+                            raw_states = None
+                    states = _normalize_item_states(items, raw_states)
+                    payload["_item_states"] = states
+                    payload["_item_done_count"] = sum(1 for state in states if state)
+
                     completed_at_epoch = row[1]
                     purge_after_epoch = row[2]
                     if completed_at_epoch is not None and purge_after_epoch is not None:
@@ -438,6 +565,28 @@ class OrderDashboardHandler(BaseHTTPRequestHandler):
                 self._send_json({"ok": False, "error": "order_id is required."}, status=HTTPStatus.BAD_REQUEST)
                 return
             STORE.mark_completed(order_id)
+            self._send_redirect("/?selected=" + quote(order_id))
+            return
+
+        if path == "/toggle-item":
+            form = self._read_form_body()
+            if form is None:
+                self._send_json({"ok": False, "error": "Invalid form body."}, status=HTTPStatus.BAD_REQUEST)
+                return
+            order_id = str(form.get("order_id", "")).strip()
+            item_index_raw = str(form.get("item_index", "")).strip()
+            next_state_raw = str(form.get("next_state", "")).strip().lower()
+            if not order_id:
+                self._send_json({"ok": False, "error": "order_id is required."}, status=HTTPStatus.BAD_REQUEST)
+                return
+            try:
+                item_index = int(item_index_raw)
+            except ValueError:
+                self._send_json({"ok": False, "error": "item_index must be an integer."}, status=HTTPStatus.BAD_REQUEST)
+                return
+
+            completed = next_state_raw in {"1", "true", "yes", "on"}
+            STORE.set_item_completed(order_id, item_index, completed)
             self._send_redirect("/?selected=" + quote(order_id))
             return
 
