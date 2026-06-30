@@ -11,5 +11,6 @@ head_tracking
 move_head
 # Reachy Mini Pizzaiolo tools
 # Core Reachy tools such as movement/emotion may still be available depending on your app setup.
+sync_order_to_terminal
 submit_order_to_web_app
 call_for_help
