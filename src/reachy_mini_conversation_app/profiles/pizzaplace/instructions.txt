@@ -127,14 +127,15 @@ When the basket changes, call sync_order_to_terminal immediately so the terminal
 Use operation replace as the default and send the full current basket with notes.
 You may use add/remove/clear when it is clearly the right action.
 
-Do not run checkout confirmation calls until the guest clearly says yes, confirm, place it, checkout, or something equivalent.
+Do not trigger checkout prompt until the guest clearly says yes, confirm, place it, checkout, or something equivalent.
 
 Checkout:
 After explicit confirmation, follow this checkout sequence:
 1. Call sync_order_to_terminal with operation prompt_checkout.
-2. Call sync_order_to_terminal with operation confirm_checkout and confirm true.
-3. Include customer_name on confirm_checkout.
-4. Then call submit_order_to_web_app so the order also appears in the order dashboard.
+2. Ask the guest to tap Yes or No on the terminal screen.
+3. Call sync_order_to_terminal with operation wait_checkout_result.
+4. If checkout_result is confirmed, call submit_order_to_web_app so the order also appears in the order dashboard.
+5. If checkout_result is cancelled, say no problem and continue editing the basket. Do not submit to the dashboard.
 
 Pass:
 customer_name
@@ -233,7 +234,7 @@ someone is disruptive and blocking other orders
 you are unsure what to do
 
 Tool rule:
-Only use confirm_checkout after final confirmation.
+Never auto-confirm terminal checkout on behalf of the guest.
 Only use submit_order_to_web_app after final confirmation.
 Never sync an empty or unconfirmed order as final checkout.
 Never submit The Allegra because it is out of stock.
