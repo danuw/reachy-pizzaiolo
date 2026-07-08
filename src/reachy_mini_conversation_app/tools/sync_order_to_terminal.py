@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import urllib.error
@@ -58,6 +59,11 @@ PAYLOAD_OPS = {
     "complete",
     "undo",
 }
+
+
+def _is_waiting_order_id(value: Any) -> bool:
+    text = str(value or "").strip().lower()
+    return text in {"", "waiting", "none", "null"}
 
 
 def _base_url() -> str:
@@ -127,7 +133,7 @@ class SyncOrderToTerminal(Tool):
     name = "sync_order_to_terminal"
     description = (
         "Sync in-progress restaurant orders with the E1003 terminal server at /payload, "
-        "and drive checkout prompts/confirms. Use this throughout ordering, not just at checkout."
+        "and drive checkout prompts/decision flow. Use this throughout ordering, not just at checkout."
     )
     parameters_schema = {
         "type": "object",
@@ -136,7 +142,7 @@ class SyncOrderToTerminal(Tool):
                 "type": "string",
                 "description": (
                     "Operation type: payload ops (add, replace, remove, clear, delete_line, adjust_line, checkout, complete, undo), "
-                    "or UI ops prompt_checkout, confirm_checkout, or health."
+                    "or UI ops prompt_checkout, confirm_checkout, wait_checkout_result, or health."
                 ),
             },
             "expected_version": {
@@ -184,6 +190,10 @@ class SyncOrderToTerminal(Tool):
                 "type": "boolean",
                 "description": "Used by confirm_checkout operation.",
             },
+            "wait_timeout_seconds": {
+                "type": "number",
+                "description": "Only for wait_checkout_result. How long to poll /health for customer decision.",
+            },
         },
         "required": ["operation"],
     }
@@ -225,6 +235,69 @@ class SyncOrderToTerminal(Tool):
                 return {"ok": False, "error": f"Terminal is unreachable at {_base_url()}: {exc.reason}"}
             except Exception as exc:
                 return {"ok": False, "error": f"confirm_checkout failed: {type(exc).__name__}: {exc}"}
+
+        if operation == "wait_checkout_result":
+            try:
+                baseline = _best_effort_health()
+                baseline_version = baseline.get("version")
+                baseline_order_id = str(
+                    kwargs.get("order_id")
+                    or baseline.get("order_id")
+                    or ""
+                ).strip()
+
+                timeout = float(
+                    kwargs.get("wait_timeout_seconds")
+                    or os.getenv("TERMINAL_CHECKOUT_WAIT_TIMEOUT_SECONDS", "25")
+                )
+                deadline = asyncio.get_event_loop().time() + max(1.0, timeout)
+
+                while asyncio.get_event_loop().time() < deadline:
+                    health = _request_json("GET", "/health")
+                    version = health.get("version")
+                    done = bool(health.get("done", False))
+                    current_order_id = str(health.get("order_id") or "").strip()
+
+                    if done:
+                        return {
+                            "ok": True,
+                            "operation": operation,
+                            "checkout_result": "confirmed",
+                            "health": health,
+                        }
+
+                    if not _is_waiting_order_id(baseline_order_id) and _is_waiting_order_id(current_order_id):
+                        return {
+                            "ok": True,
+                            "operation": operation,
+                            "checkout_result": "confirmed",
+                            "health": health,
+                        }
+
+                    if (
+                        isinstance(version, int)
+                        and isinstance(baseline_version, int)
+                        and version > baseline_version
+                    ):
+                        return {
+                            "ok": True,
+                            "operation": operation,
+                            "checkout_result": "cancelled",
+                            "health": health,
+                        }
+
+                    await asyncio.sleep(0.6)
+
+                return {
+                    "ok": True,
+                    "operation": operation,
+                    "checkout_result": "cancelled",
+                    "health": _best_effort_health(),
+                }
+            except urllib.error.URLError as exc:
+                return {"ok": False, "error": f"Terminal is unreachable at {_base_url()}: {exc.reason}"}
+            except Exception as exc:
+                return {"ok": False, "error": f"wait_checkout_result failed: {type(exc).__name__}: {exc}"}
 
         if operation not in PAYLOAD_OPS:
             return {"ok": False, "error": f"Unsupported operation '{operation}'."}
