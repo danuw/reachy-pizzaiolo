@@ -44,9 +44,84 @@ ITEM_ALIASES = {
     "the neroli": "The Neroli",
     "dan": "The Dan",
     "the dan": "The Dan",
+    "margherita": "The Zekey",
+    "zekey margherita": "The Zekey",
+    "margherita with olives": "The Neroli",
+    "neroli margherita": "The Neroli",
+    "tuna pizza": "The Dan",
 }
 
 OUT_OF_STOCK = {"The Allegra"}
+
+
+def _is_waiting_order_id(value: Any) -> bool:
+    text = str(value or "").strip().lower()
+    return text in {"", "waiting", "none", "null"}
+
+
+def _terminal_base_url() -> str:
+    raw = os.getenv("TERMINAL_BASE_URL", "http://192.168.68.147").strip().rstrip("/")
+    parsed = urlparse(raw)
+    if not parsed.scheme:
+        return f"http://{raw}"
+    return raw
+
+
+def _terminal_timeout_seconds() -> float:
+    return float(os.getenv("TERMINAL_TIMEOUT_SECONDS", "5"))
+
+
+def _terminal_request_json(method: str, path: str, payload: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    url = _terminal_base_url() + path
+    body = None if payload is None else json.dumps(payload).encode("utf-8")
+    headers = {"Accept": "application/json"}
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+
+    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+    with urllib.request.urlopen(req, timeout=_terminal_timeout_seconds()) as response:
+        raw = response.read().decode("utf-8")
+        return json.loads(raw) if raw else {}
+
+
+def _best_effort_reset_terminal_checkout(customer_name: str, order_id: str) -> Dict[str, Any]:
+    result: Dict[str, Any] = {"attempted": True, "ok": False}
+
+    try:
+        health = _terminal_request_json("GET", "/health")
+    except Exception as exc:
+        result["error"] = f"terminal health unavailable: {type(exc).__name__}: {exc}"
+        return result
+
+    expected_version = health.get("version") if isinstance(health.get("version"), int) else None
+    terminal_order_id = str(health.get("order_id") or "").strip()
+    selected_order_id = str(order_id or terminal_order_id).strip()
+
+    try:
+        confirm_payload: Dict[str, Any] = {"confirm": True}
+        if customer_name:
+            confirm_payload["customer_name"] = customer_name
+        _terminal_request_json("POST", "/ui/checkout/confirm", confirm_payload)
+    except Exception:
+        pass
+
+    complete_payload: Dict[str, Any] = {
+        "operation": "complete",
+        "age_verified_for_alcohol": False,
+    }
+    if expected_version is not None:
+        complete_payload["expected_version"] = expected_version
+    if selected_order_id and not _is_waiting_order_id(selected_order_id):
+        complete_payload["order_id"] = selected_order_id
+
+    try:
+        response = _terminal_request_json("POST", "/payload", complete_payload)
+        result["ok"] = True
+        result["response"] = response
+    except Exception as exc:
+        result["error"] = f"terminal reset failed: {type(exc).__name__}: {exc}"
+
+    return result
 
 
 def _normalise_item(raw: Dict[str, Any]) -> Dict[str, Any]:
@@ -229,10 +304,12 @@ class SubmitOrderToWebApp(Tool):
             }
 
         accepted_order_id = str(payload.get("order_id") or order["order_id"])
+        terminal_reset = _best_effort_reset_terminal_checkout(customer_name, accepted_order_id)
 
         return {
             "ok": True,
             "order_id": accepted_order_id,
             "web_app_url": _dashboard_url_from_api(api_url),
+            "terminal_checkout_reset": terminal_reset,
             "message": f"Order submitted for {customer_name}.",
         }
